@@ -1,128 +1,167 @@
-// ====== Reikalingi moduliai ======
-const express = require('express');
-const { exec } = require('child_process');
-const fs = require('fs/promises');
-const path = require('path');
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+import express from 'express';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import ffmpeg from 'fluent-ffmpeg';
+import ffmpegStatic from 'ffmpeg-static';
+import axios from 'axios';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-// ====== Konfigūracija ======
-const app = express();
-app.use(express.json());
-
-// Konfigūruojame S3 klientą darbui su Cloudflare R2.
-// Visi duomenys paimami iš Environment Variables, kuriuos nustatėte Render.com.
-const s3 = new S3Client({
-    region: "auto",
-    endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-    credentials: {
+// --- KONFIGŪRACIJA ---
+// Nuskaitome aplinkos kintamuosius, kuriuos sukonfigūravote Render.com
+const config = {
+    port: process.env.PORT || 10000,
+    r2: {
+        accountId: process.env.R2_ACCOUNT_ID,
         accessKeyId: process.env.R2_ACCESS_KEY_ID,
         secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+        bucketName: process.env.R2_BUCKET_NAME,
+    },
+    worker: {
+        callbackUrl: process.env.WORKER_CALLBACK_URL,
+        callbackSecret: process.env.WORKER_CALLBACK_SECRET,
+    },
+    webhookSecret: process.env.WEBHOOK_SECRET
+};
+
+// Nustatome FFmpeg kelią
+ffmpeg.setFfmpegPath(ffmpegStatic);
+
+// --- R2 KLIENTO INICIALIZAVIMAS ---
+const R2_ENDPOINT = `https://${config.r2.accountId}.r2.cloudflarestorage.com`;
+const s3Client = new S3Client({
+    region: 'auto',
+    endpoint: R2_ENDPOINT,
+    credentials: {
+        accessKeyId: config.r2.accessKeyId,
+        secretAccessKey: config.r2.secretAccessKey,
     },
 });
 
-// ====== API Endpoint'as ======
-// Šį adresą kviečia jūsų pagrindinis Cloudflare Worker
-app.post('/create-preview', async (req, res) => {
+// --- APLIKACIJOS PALEIDIMAS ---
+const app = express();
+app.use(express.json());
+
+// --- SAUGUMO FUNKCIJA (MIDDLEWARE) ---
+// Tikrina, ar užklausa iš Worker'io yra autentiška
+const verifySecret = (req, res, next) => {
+    const secret = req.headers['x-webhook-secret'];
+    if (!config.webhookSecret || secret !== config.webhookSecret) {
+        console.warn('Invalid or missing webhook secret.');
+        return res.status(401).send('Unauthorized');
+    }
+    next();
+};
+
+// --- PAGRINDINIS MARŠRUTAS ---
+// /create-preview yra adresas, kurį nurodėte Cloudflare Worker'iui
+app.post('/create-preview', verifySecret, async (req, res) => {
     const { internalTaskId, sunoVariants, customerId } = req.body;
 
-    // Patikriname, ar gavome visus reikiamus duomenis
-    if (!internalTaskId || !sunoVariants || !Array.isArray(sunoVariants)) {
-        return res.status(400).send({ error: 'Missing required parameters.' });
+    if (!internalTaskId || !Array.isArray(sunoVariants) || !customerId) {
+        return res.status(400).send('Missing required payload fields.');
     }
+    
+    // Iškart atsakome Worker'iui, kad užduotį gavome ir apdorosime fone.
+    res.status(202).send({ status: 'accepted', message: 'Processing started.' });
 
-    // Svarbu: iškart grąžiname atsakymą, o darbus tęsiame fone.
-    res.status(202).send({ message: 'Accepted, processing started.' });
+    console.log(`[${internalTaskId}] Starting processing for ${sunoVariants.length} variants.`);
 
-    // Tęsiame darbus fone
     try {
-        console.log(`[${internalTaskId}] Processing started for ${sunoVariants.length} variants.`);
+        // Apdorojame abu variantus lygiagrečiai
+        const processingPromises = sunoVariants.map(variant => processVariant(variant, internalTaskId));
+        const finalItems = await Promise.all(processingPromises);
 
-        for (const variant of sunoVariants) {
-            const streamUrl = variant.streamUrl;
-            if (!streamUrl) {
-                console.log(`[${internalTaskId}] Variant ${variant.index} is missing streamUrl. Skipping.`);
-                continue;
-            }
+        // Kai abu variantai apdoroti, siunčiame atsakymą atgal į Worker'į
+        await axios.post(config.worker.callbackUrl, {
+            mode: 'conversion-complete',
+            customerId,
+            taskId: internalTaskId,
+            finalItems,
+        }, {
+            headers: { 'X-Webhook-Secret': config.worker.callbackSecret }
+        });
 
-            const r2Prefix = `previews/${internalTaskId}-${variant.index}`;
-            const tmpDir = await fs.mkdtemp(path.join('/tmp/', `dainify-${variant.index}-`));
-            
-            console.log(`[${internalTaskId}-${variant.index}] Created temp directory: ${tmpDir}`);
-            
-            // 1. Atsisiunčiame ~30s iš HLS srauto į laikiną MP3 failą
-            console.log(`[${internalTaskId}-${variant.index}] Downloading stream from Suno...`);
-            await runCommand(`ffmpeg -i "${streamUrl}" -t 30 -c copy ${tmpDir}/temp.mp3`);
-
-            // 2. Pridedame 5 sekundžių nutildymą (fade-out) nuo 25-os sekundės
-            console.log(`[${internalTaskId}-${variant.index}] Applying fade-out...`);
-            await runCommand(`ffmpeg -i ${tmpDir}/temp.mp3 -af "afade=t=out:st=25:d=5" -y ${tmpDir}/temp_faded.mp3`);
-
-            // 3. Konvertuojame į HLS segmentus (4 sekundžių trukmės)
-            console.log(`[${internalTaskId}-${variant.index}] Segmenting into HLS...`);
-            await runCommand(`ffmpeg -i ${tmpDir}/temp_faded.mp3 -c:a aac -b:a 128k -hls_time 4 -hls_playlist_type vod -hls_segment_filename "${tmpDir}/seg_%03d.aac" ${tmpDir}/demo.m3u8`);
-
-            // 4. Įkeliame visus sugeneruotus failus į R2 saugyklą
-            console.log(`[${internalTaskId}-${variant.index}] Uploading files to R2 bucket...`);
-            await uploadDirectoryToR2(tmpDir, r2Prefix);
-
-            // 5. Išvalome laikiną katalogą
-            console.log(`[${internalTaskId}-${variant.index}] Cleaning up temporary files...`);
-            await fs.rm(tmpDir, { recursive: true, force: true });
-        }
-        
-        console.log(`[${internalTaskId}] All variants processed successfully.`);
+        console.log(`[${internalTaskId}] Successfully processed and sent callback.`);
 
     } catch (error) {
         console.error(`[${internalTaskId}] CRITICAL ERROR during processing:`, error);
+        // Čia galite pridėti logiką, kuri praneštų apie klaidą, pvz., per kitą webhook'ą
     }
 });
 
-// ====== Serverio Paleidimas ======
-// Naudojame 10000 portą, kaip reikalauja Render
-app.listen(10000, () => console.log('✅ Conversion server is running on port 10000.'));
+app.listen(config.port, () => {
+    console.log(`Dainify Konverteris is running on port ${config.port}`);
+});
 
-
-// ====== Pagalbinės Funkcijos ======
+// --- PAGALBINĖS FUNKCIJOS ---
 
 /**
- * Vykdo komandinės eilutės komandą ir grąžina Promise.
- * @param {string} command - Komanda, kurią reikia įvykdyti.
- * @returns {Promise<string>} - Promise, kuris grąžina komandos išvestį.
+ * Apdoroja vieną dainos variantą: atsisiunčia, apkerpa, konvertuoja į HLS ir įkelia į R2.
  */
-function runCommand(command) {
-    return new Promise((resolve, reject) => {
-        exec(command, (error, stdout, stderr) => {
-            if (error) {
-                console.error(`❌ Error executing command: ${command}`);
-                console.error(`   stderr: ${stderr}`);
-                return reject(error);
-            }
-            resolve(stdout);
+async function processVariant(variant, internalTaskId) {
+    const tempDir = await fs.mkdtemp(path.join('/tmp', `song-${variant.id}-`));
+    const originalFilePath = path.join(tempDir, 'original.mp3');
+    const hlsOutputPath = path.join(tempDir, 'demo.m3u8');
+    const variantTaskId = `${internalTaskId}-${variant.index}`;
+    
+    try {
+        // 1. Atsisiunčiame originalų MP3 failą
+        console.log(`[${variantTaskId}] Downloading from ${variant.audioUrl}`);
+        const response = await axios({ url: variant.audioUrl, responseType: 'stream' });
+        await new Promise((resolve, reject) => {
+            const writer = response.data.pipe(fs.createWriteStream(originalFilePath));
+            writer.on('finish', resolve);
+            writer.on('error', reject);
         });
-    });
-}
 
-/**
- * Įkelia visus failus iš nurodyto katalogo į R2 saugyklą.
- * @param {string} directoryPath - Vietinis katalogas, iš kurio kelti failus.
- * @param {string} r2Prefix - R2 kelias (prefix), į kurį kelti failus.
- */
-async function uploadDirectoryToR2(directoryPath, r2Prefix) {
-    const files = await fs.readdir(directoryPath);
-    for (const file of files) {
-        // Įkeliame tik .m3u8 ir .aac failus
-        if (file.endsWith('.m3u8') || file.endsWith('.aac')) {
-            const localFilePath = path.join(directoryPath, file);
-            const r2Key = `${r2Prefix}/${file}`;
-            
-            await s3.send(new PutObjectCommand({
-                Bucket: process.env.R2_BUCKET_NAME,
-                Key: r2Key,
-                Body: await fs.readFile(localFilePath),
-                ContentType: file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'audio/aac'
-            }));
+        // 2. Konvertuojame į 30s HLS peržiūrą su FFmpeg
+        console.log(`[${variantTaskId}] Converting to HLS...`);
+        await new Promise((resolve, reject) => {
+            ffmpeg(originalFilePath)
+                .setStartTime(0)
+                .duration(30)
+                .outputOptions([
+                    '-f hls',
+                    '-hls_time 10', // 10 sekundžių segmentai
+                    '-hls_list_size 0', // Neribotas segmentų sąrašas
+                    '-hls_segment_filename', `${tempDir}/segment%03d.ts`
+                ])
+                .on('end', resolve)
+                .on('error', (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
+                .save(hlsOutputPath);
+        });
 
-            console.log(`   ✔ Uploaded ${file} to ${r2Key}`);
+        // 3. Įkeliame HLS failus į R2
+        console.log(`[${variantTaskId}] Uploading to R2...`);
+        const filesToUpload = await fs.readdir(tempDir);
+        for (const file of filesToUpload) {
+            if (file.endsWith('.m3u8') || file.endsWith('.ts')) {
+                const filePath = path.join(tempDir, file);
+                const fileContent = await fs.readFile(filePath);
+                const r2Key = `previews/${variantTaskId}/${file}`;
+                
+                await s3Client.send(new PutObjectCommand({
+                    Bucket: config.r2.bucketName,
+                    Key: r2Key,
+                    Body: fileContent,
+                    ContentType: file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t',
+                }));
+            }
         }
+
+        // 4. Grąžiname rezultatą, kurio reikės callback'ui
+        return {
+            index: variant.index,
+            title: variant.title,
+            cover: variant.imageUrl,
+            fullUrl: variant.audioUrl,
+            previewR2Path: `previews/${variantTaskId}/demo.m3u8`, // Kelias iki pagrindinio HLS failo R2
+        };
+
+    } finally {
+        // 5. Išvalome laikinus failus
+        await fs.rm(tempDir, { recursive: true, force: true });
+        console.log(`[${variantTaskId}] Cleaned up temp files.`);
     }
 }
