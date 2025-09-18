@@ -22,7 +22,9 @@ app.post('/create-preview', async (req, res) => {
             const tmpDir = await fs.mkdtemp(path.join('/tmp/', `dainify-${variant.index}-`));
 
             // 1. Atsisiunčiame 30s iš HLS srauto
+            console.log(`Starting ffmpeg for URL: ${streamUrl}`);
             await runCommand(`ffmpeg -i "${streamUrl}" -t 30 -c copy ${tmpDir}/temp.mp3`);
+            console.log('Finished ffmpeg. Starting R2 upload.');
             
             // 2. Pridedame fade-out
             await runCommand(`ffmpeg -i ${tmpDir}/temp.mp3 -af "afade=t=out:st=25:d=5" ${tmpDir}/temp_faded.mp3`);
@@ -32,6 +34,7 @@ app.post('/create-preview', async (req, res) => {
 
             // 4. Įkeliame failus į R2
             await uploadDirectoryToR2(tmpDir, r2Prefix);
+            console.log('Upload to R2 complete.');
 
             // 5. Išvalome laikinus failus
             await fs.rm(tmpDir, { recursive: true, force: true });
