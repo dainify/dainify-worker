@@ -1,6 +1,6 @@
 import express from 'express';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
-import ffmpeg from 'fluent-ffmpeg';
+import Ffmpeg from 'fluent-ffmpeg'; // Pakeista iš 'ffmpeg' į 'Ffmpeg' (didžioji raidė)
 import ffmpegStatic from 'ffmpeg-static';
 import axios from 'axios';
 import fs from 'fs/promises';
@@ -25,6 +25,7 @@ const config = {
 };
 
 // Nustatome FFmpeg kelią
+const ffmpeg = Ffmpeg; // Priskiriame Ffmpeg prie kintamojo su mažąja raide
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
 // --- R2 KLIENTO INICIALIZAVIMAS ---
