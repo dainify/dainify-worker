@@ -49,7 +49,7 @@ app.post('/create-preview', async (req, res) => {
     }
 });
 
-app.listen(3000, () => console.log('Conversion server is running.'));
+app.listen(10000, () => console.log('Conversion server is running.'));
 
 // Pagalbinės funkcijos runCommand ir uploadDirectoryToR2
 // ...
