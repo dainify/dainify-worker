@@ -1,23 +1,23 @@
-# Naudojame oficialų Node.js 18 atvaizdą
-FROM node:18-slim
+# Naudojame oficialų Node.js 20 atvaizdą
+FROM node:20-slim
 
-# Įdiegiame FFMPEG ir kitus reikalingus paketus
+# Įdiegiame FFmpeg
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
-# Nustatome darbo direktoriją konteinerio viduje
+# Nustatome darbinį katalogą
 WORKDIR /usr/src/app
 
-# Kopijuojame package.json ir package-lock.json
+# Nukopijuojame package.json ir package-lock.json
 COPY package*.json ./
 
-# Įdiegiame projekto priklausomybes
+# Įdiegiame priklausomybes
 RUN npm install
 
-# Kopijuojame likusį aplikacijos kodą
+# Nukopijuojame likusį aplikacijos kodą
 COPY . .
 
-# Nurodome, kad aplikacija naudos 10000 portą
+# Nurodome, kad aplikacija veiks per 10000 portą (Render naudos šį)
 EXPOSE 10000
 
-# Komanda, kuri bus paleista konteineriui startavus
-CMD [ "npm", "start" ]
+# Komanda, kuri bus paleista paleidus konteinerį
+CMD [ "node", "index.js" ]
