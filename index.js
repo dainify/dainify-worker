@@ -11,7 +11,7 @@ import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import Ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
 import axios from 'axios';
-import fs from 'fs/promises';
+import fs from 'fs/promises'; // Naudojame 'fs/promises' visiems veiksmams
 import path from 'path';
 
 // --- KONFIGŪRACIJA ---
@@ -65,14 +65,12 @@ const verifySecret = (req, res, next) => {
 // --- MARŠRUTAI (ROUTES) ---
 
 // Sveikatos patikros maršrutas (Health Check)
-// Leidžia Render platformai ir jums patikrinti, ar servisas veikia.
 app.get('/health', (req, res) => {
     res.status(200).send({ status: 'ok', message: 'Dainify Konverteris is running.' });
 });
 
 /**
  * Pagrindinis maršrutas peržiūrų kūrimui.
- * Priima POST užklausą su dainų variantais iš Cloudflare Worker'io.
  */
 app.post('/create-preview', verifySecret, async (req, res) => {
     const { internalTaskId, sunoVariants, customerId } = req.body;
@@ -81,20 +79,17 @@ app.post('/create-preview', verifySecret, async (req, res) => {
         return res.status(400).send('Bad Request: Missing required payload fields.');
     }
     
-    // Iškart atsakome Worker'iui "202 Accepted", patvirtindami, kad užduotį gavome.
-    // Tai leidžia Worker'iui nelaukti, kol baigsis ilgas konvertavimo procesas.
+    // Iškart atsakome Worker'iui "202 Accepted"
     res.status(202).send({ status: 'accepted', message: 'Processing started in the background.' });
 
     console.log(`[${internalTaskId}] Starting processing for ${sunoVariants.length} variants.`);
 
     try {
-        // Apdorojame variantus lygiagrečiai, bet naudojame Promise.allSettled,
-        // kad vieno varianto klaida nesustabdytų viso proceso.
+        // Apdorojame variantus lygiagrečiai, naudojant Promise.allSettled
         const results = await Promise.allSettled(
             sunoVariants.map(variant => processVariant(variant, internalTaskId))
         );
 
-        // Atskiriame sėkmingai apdorotus variantus nuo tų, kuriuose įvyko klaida.
         const finalItems = results
             .filter(result => result.status === 'fulfilled')
             .map(result => result.value);
@@ -109,15 +104,15 @@ app.post('/create-preview', verifySecret, async (req, res) => {
         
         if (finalItems.length === 0) {
             console.error(`[${internalTaskId}] All variants failed. No callback will be sent.`);
-            return; // Nesiunčiame callback, jei nėra ką siųsti.
+            return;
         }
 
-        // Kai variantai apdoroti, siunčiame atsakymą atgal į Worker'į.
+        // Siunčiame atsakymą atgal į Worker'į
         await axios.post(config.worker.callbackUrl, {
             mode: 'conversion-complete',
             customerId,
             taskId: internalTaskId,
-            finalItems, // Siunčiame tik sėkmingai apdorotus
+            finalItems,
         }, {
             headers: { 'X-Webhook-Secret': config.worker.callbackSecret }
         });
@@ -146,15 +141,20 @@ async function processVariant(variant, internalTaskId) {
     const tempDir = await fs.mkdtemp(path.join('/tmp', `song-${variantTaskId}-`));
     
     try {
-        // 1. Atsisiunčiame originalų MP3 failą
+        // 1. Atsisiunčiame originalų MP3 failą kaip dvejetainį buferį (binary buffer)
         const originalFilePath = path.join(tempDir, 'original.mp3');
         console.log(`[${variantTaskId}] Downloading from ${variant.audioUrl}`);
-        const response = await axios({ url: variant.audioUrl, responseType: 'stream' });
-        await new Promise((resolve, reject) => {
-            const writer = response.data.pipe(fs.createWriteStream(originalFilePath));
-            writer.on('finish', resolve);
-            writer.on('error', reject);
+        
+        // PAKEISTA: Naudojame 'arraybuffer' vietoj 'stream', kad išvengtume klaidų.
+        const response = await axios({
+            url: variant.audioUrl,
+            responseType: 'arraybuffer' 
         });
+
+        // PAKEISTA: Naudojame modernų fs.writeFile vietoj seno stream.pipe.
+        // Tai išsprendžia "fs.createWriteStream is not a function" klaidą.
+        await fs.writeFile(originalFilePath, response.data);
+        console.log(`[${variantTaskId}] File downloaded successfully.`);
 
         // 2. Konvertuojame į 30s HLS peržiūrą su FFmpeg
         const hlsOutputPath = path.join(tempDir, 'demo.m3u8');
@@ -165,8 +165,8 @@ async function processVariant(variant, internalTaskId) {
                 .duration(30)
                 .outputOptions([
                     '-f hls',
-                    '-hls_time 10',          // 10 sekundžių segmentai
-                    '-hls_list_size 0',      // Neribotas segmentų sąrašas
+                    '-hls_time 10',
+                    '-hls_list_size 0',
                     '-hls_segment_filename', `${tempDir}/segment%03d.ts`
                 ])
                 .on('end', resolve)
