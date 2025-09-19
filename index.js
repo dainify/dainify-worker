@@ -1,14 +1,21 @@
+/**
+ * Dainify Konverteris
+ * Šis Express.js servisas, veikiantis Render.com platformoje, yra skirtas
+ * gauti dainų variantus iš Cloudflare Worker'io, sukurti jų 30 sekundžių
+ * HLS peržiūras (demo versijas) ir įkelti jas į R2 saugyklą.
+ * Baigęs darbą, servisas išsiunčia pranešimą ("callback") atgal į Worker'į.
+ */
+
 import express from 'express';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
-import Ffmpeg from 'fluent-ffmpeg'; // Pakeista iš 'ffmpeg' į 'Ffmpeg' (didžioji raidė)
+import Ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
 import axios from 'axios';
 import fs from 'fs/promises';
 import path from 'path';
-import { fileURLToPath } from 'url';
 
 // --- KONFIGŪRACIJA ---
-// Nuskaitome aplinkos kintamuosius, kuriuos sukonfigūravote Render.com
+// Nuskaitome aplinkos kintamuosius (Environment Variables) iš Render.com
 const config = {
     port: process.env.PORT || 10000,
     r2: {
@@ -24,11 +31,9 @@ const config = {
     webhookSecret: process.env.WEBHOOK_SECRET
 };
 
-// Nustatome FFmpeg kelią
-const ffmpeg = Ffmpeg; // Priskiriame Ffmpeg prie kintamojo su mažąja raide
-ffmpeg.setFfmpegPath(ffmpegStatic);
+// --- FFmpeg IR R2 KLIENTŲ INICIALIZAVIMAS ---
+Ffmpeg.setFfmpegPath(ffmpegStatic);
 
-// --- R2 KLIENTO INICIALIZAVIMAS ---
 const R2_ENDPOINT = `https://${config.r2.accountId}.r2.cloudflarestorage.com`;
 const s3Client = new S3Client({
     region: 'auto',
@@ -39,75 +44,110 @@ const s3Client = new S3Client({
     },
 });
 
-// --- APLIKACIJOS PALEIDIMAS ---
+// --- EXPRESS APLIKACIJOS PALEIDIMAS ---
 const app = express();
 app.use(express.json());
 
-// --- SAUGUMO FUNKCIJA (MIDDLEWARE) ---
-// Tikrina, ar užklausa iš Worker'io yra autentiška
+/**
+ * Saugumo Middleware
+ * Tikrina, ar gaunama užklausa turi teisingą slaptažodį ('x-webhook-secret' antraštėje),
+ * kad apsaugotų servisą nuo neteisėtų iškvietimų.
+ */
 const verifySecret = (req, res, next) => {
     const secret = req.headers['x-webhook-secret'];
     if (!config.webhookSecret || secret !== config.webhookSecret) {
-        console.warn('Invalid or missing webhook secret.');
+        console.warn('Unauthorized attempt: Invalid or missing webhook secret.');
         return res.status(401).send('Unauthorized');
     }
     next();
 };
 
-// --- PAGRINDINIS MARŠRUTAS ---
-// /create-preview yra adresas, kurį nurodėte Cloudflare Worker'iui
+// --- MARŠRUTAI (ROUTES) ---
+
+// Sveikatos patikros maršrutas (Health Check)
+// Leidžia Render platformai ir jums patikrinti, ar servisas veikia.
+app.get('/health', (req, res) => {
+    res.status(200).send({ status: 'ok', message: 'Dainify Konverteris is running.' });
+});
+
+/**
+ * Pagrindinis maršrutas peržiūrų kūrimui.
+ * Priima POST užklausą su dainų variantais iš Cloudflare Worker'io.
+ */
 app.post('/create-preview', verifySecret, async (req, res) => {
     const { internalTaskId, sunoVariants, customerId } = req.body;
 
     if (!internalTaskId || !Array.isArray(sunoVariants) || !customerId) {
-        return res.status(400).send('Missing required payload fields.');
+        return res.status(400).send('Bad Request: Missing required payload fields.');
     }
     
-    // Iškart atsakome Worker'iui, kad užduotį gavome ir apdorosime fone.
-    res.status(202).send({ status: 'accepted', message: 'Processing started.' });
+    // Iškart atsakome Worker'iui "202 Accepted", patvirtindami, kad užduotį gavome.
+    // Tai leidžia Worker'iui nelaukti, kol baigsis ilgas konvertavimo procesas.
+    res.status(202).send({ status: 'accepted', message: 'Processing started in the background.' });
 
     console.log(`[${internalTaskId}] Starting processing for ${sunoVariants.length} variants.`);
 
     try {
-        // Apdorojame abu variantus lygiagrečiai
-        const processingPromises = sunoVariants.map(variant => processVariant(variant, internalTaskId));
-        const finalItems = await Promise.all(processingPromises);
+        // Apdorojame variantus lygiagrečiai, bet naudojame Promise.allSettled,
+        // kad vieno varianto klaida nesustabdytų viso proceso.
+        const results = await Promise.allSettled(
+            sunoVariants.map(variant => processVariant(variant, internalTaskId))
+        );
 
-        // Kai abu variantai apdoroti, siunčiame atsakymą atgal į Worker'į
+        // Atskiriame sėkmingai apdorotus variantus nuo tų, kuriuose įvyko klaida.
+        const finalItems = results
+            .filter(result => result.status === 'fulfilled')
+            .map(result => result.value);
+
+        const failedItems = results
+            .filter(result => result.status === 'rejected')
+            .map(result => result.reason.message || 'Unknown error');
+
+        if (failedItems.length > 0) {
+            console.error(`[${internalTaskId}] ${failedItems.length} variant(s) failed to process:`, failedItems);
+        }
+        
+        if (finalItems.length === 0) {
+            console.error(`[${internalTaskId}] All variants failed. No callback will be sent.`);
+            return; // Nesiunčiame callback, jei nėra ką siųsti.
+        }
+
+        // Kai variantai apdoroti, siunčiame atsakymą atgal į Worker'į.
         await axios.post(config.worker.callbackUrl, {
             mode: 'conversion-complete',
             customerId,
             taskId: internalTaskId,
-            finalItems,
+            finalItems, // Siunčiame tik sėkmingai apdorotus
         }, {
             headers: { 'X-Webhook-Secret': config.worker.callbackSecret }
         });
 
-        console.log(`[${internalTaskId}] Successfully processed and sent callback.`);
+        console.log(`[${internalTaskId}] Successfully processed ${finalItems.length} variant(s) and sent callback.`);
 
     } catch (error) {
-        console.error(`[${internalTaskId}] CRITICAL ERROR during processing:`, error);
-        // Čia galite pridėti logiką, kuri praneštų apie klaidą, pvz., per kitą webhook'ą
+        console.error(`[${internalTaskId}] A critical unexpected error occurred:`, error);
     }
 });
 
+// Startuojame serverį
 app.listen(config.port, () => {
     console.log(`Dainify Konverteris is running on port ${config.port}`);
 });
 
-// --- PAGALBINĖS FUNKCIJOS ---
 
 /**
- * Apdoroja vieną dainos variantą: atsisiunčia, apkerpa, konvertuoja į HLS ir įkelia į R2.
+ * Pagalbinė funkcija, apdorojanti vieną dainos variantą.
+ * @param {object} variant - Dainos varianto objektas iš Suno.
+ * @param {string} internalTaskId - Vidinis užduoties ID.
+ * @returns {Promise<object>} Objektas su informacija apie sukurtą peržiūrą.
  */
 async function processVariant(variant, internalTaskId) {
-    const tempDir = await fs.mkdtemp(path.join('/tmp', `song-${variant.id}-`));
-    const originalFilePath = path.join(tempDir, 'original.mp3');
-    const hlsOutputPath = path.join(tempDir, 'demo.m3u8');
     const variantTaskId = `${internalTaskId}-${variant.index}`;
+    const tempDir = await fs.mkdtemp(path.join('/tmp', `song-${variantTaskId}-`));
     
     try {
         // 1. Atsisiunčiame originalų MP3 failą
+        const originalFilePath = path.join(tempDir, 'original.mp3');
         console.log(`[${variantTaskId}] Downloading from ${variant.audioUrl}`);
         const response = await axios({ url: variant.audioUrl, responseType: 'stream' });
         await new Promise((resolve, reject) => {
@@ -117,15 +157,16 @@ async function processVariant(variant, internalTaskId) {
         });
 
         // 2. Konvertuojame į 30s HLS peržiūrą su FFmpeg
-        console.log(`[${variantTaskId}] Converting to HLS...`);
+        const hlsOutputPath = path.join(tempDir, 'demo.m3u8');
+        console.log(`[${variantTaskId}] Converting to HLS preview...`);
         await new Promise((resolve, reject) => {
-            ffmpeg(originalFilePath)
+            Ffmpeg(originalFilePath)
                 .setStartTime(0)
                 .duration(30)
                 .outputOptions([
                     '-f hls',
-                    '-hls_time 10', // 10 sekundžių segmentai
-                    '-hls_list_size 0', // Neribotas segmentų sąrašas
+                    '-hls_time 10',          // 10 sekundžių segmentai
+                    '-hls_list_size 0',      // Neribotas segmentų sąrašas
                     '-hls_segment_filename', `${tempDir}/segment%03d.ts`
                 ])
                 .on('end', resolve)
@@ -133,8 +174,8 @@ async function processVariant(variant, internalTaskId) {
                 .save(hlsOutputPath);
         });
 
-        // 3. Įkeliame HLS failus į R2
-        console.log(`[${variantTaskId}] Uploading to R2...`);
+        // 3. Įkeliame HLS failus (.m3u8 ir .ts) į R2
+        console.log(`[${variantTaskId}] Uploading HLS files to R2...`);
         const filesToUpload = await fs.readdir(tempDir);
         for (const file of filesToUpload) {
             if (file.endsWith('.m3u8') || file.endsWith('.ts')) {
@@ -151,7 +192,7 @@ async function processVariant(variant, internalTaskId) {
             }
         }
 
-        // 4. Grąžiname rezultatą, kurio reikės callback'ui
+        // 4. Grąžiname rezultatą, kurio reikės callback'ui į Worker'į
         return {
             index: variant.index,
             title: variant.title,
@@ -161,8 +202,8 @@ async function processVariant(variant, internalTaskId) {
         };
 
     } finally {
-        // 5. Išvalome laikinus failus
+        // 5. Būtinai išvalome laikinus failus, net jei įvyko klaida
         await fs.rm(tempDir, { recursive: true, force: true });
-        console.log(`[${variantTaskId}] Cleaned up temp files.`);
+        console.log(`[${variantTaskId}] Cleaned up temporary files.`);
     }
 }
