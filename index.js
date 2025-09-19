@@ -1,12 +1,17 @@
 /**
  * Dainify Konverteris
+ * Šis Express.js servisas, veikiantis Render.com platformoje, yra skirtas
+ * gauti dainų variantus iš Cloudflare Worker'io, sukurti jų 30 sekundžių
+ * HLS peržiūras (demo versijas) ir įkelti jas į R2 saugyklą.
+ * Baigęs darbą, servisas išsiunčia pranešimą ("callback") atgal į Worker'į.
  */
+
 import express from 'express';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import Ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
 import axios from 'axios';
-import fs from 'fs/promises';
+import fs from 'fs/promises'; // Naudojame 'fs/promises' visiems veiksmams
 import path from 'path';
 
 // --- KONFIGŪRACIJA ---
@@ -27,6 +32,7 @@ const config = {
 
 // --- INICIALIZAVIMAS ---
 Ffmpeg.setFfmpegPath(ffmpegStatic);
+
 const R2_ENDPOINT = `https://${config.r2.accountId}.r2.cloudflarestorage.com`;
 const s3Client = new S3Client({
     region: 'auto',
@@ -60,7 +66,7 @@ app.post('/create-preview', verifySecret, async (req, res) => {
     if (!internalTaskId || !Array.isArray(sunoVariants) || !customerId) {
         return res.status(400).send('Bad Request: Missing required payload fields.');
     }
-    res.status(202).send({ status: 'accepted', message: 'Processing started.' });
+    res.status(202).send({ status: 'accepted', message: 'Processing started in the background.' });
 
     console.log(`[${internalTaskId}] Starting processing for ${sunoVariants.length} variants.`);
     try {
@@ -69,7 +75,7 @@ app.post('/create-preview', verifySecret, async (req, res) => {
         );
         const finalItems = results.filter(r => r.status === 'fulfilled').map(r => r.value);
         if (finalItems.length === 0) {
-            console.error(`[${internalTaskId}] All variants failed. No callback sent.`);
+            console.error(`[${internalTaskId}] All variants failed. No callback will be sent.`);
             return;
         }
         await axios.post(config.worker.callbackUrl, {
@@ -77,7 +83,7 @@ app.post('/create-preview', verifySecret, async (req, res) => {
         }, { headers: { 'X-Webhook-Secret': config.worker.callbackSecret } });
         console.log(`[${internalTaskId}] Successfully processed ${finalItems.length} variant(s) and sent callback.`);
     } catch (error) {
-        console.error(`[${internalTaskId}] Critical error during processing:`, error);
+        console.error(`[${internalTaskId}] A critical unexpected error occurred:`, error);
     }
 });
 
@@ -85,22 +91,32 @@ app.listen(config.port, () => {
     console.log(`Dainify Konverteris is running on port ${config.port}`);
 });
 
-// --- PAGALBINĖ FUNKCIJA ---
+
+/**
+ * Pagalbinė funkcija, apdorojanti vieną dainos variantą.
+ * @param {object} variant - Dainos varianto objektas iš Suno.
+ * @param {string} internalTaskId - Vidinis užduoties ID.
+ * @returns {Promise<object>} Objektas su informacija apie sukurtą peržiūrą.
+ */
 async function processVariant(variant, internalTaskId) {
     const variantTaskId = `${internalTaskId}-${variant.index}`;
     const tempDir = await fs.mkdtemp(path.join('/tmp', `song-${variantTaskId}-`));
     
     try {
-        // 1. Atsisiunčiame failą
+        // 1. Atsisiunčiame originalų MP3 failą
         const originalFilePath = path.join(tempDir, 'original.mp3');
         console.log(`[${variantTaskId}] Downloading from ${variant.audioUrl}`);
         if (!variant.audioUrl) throw new Error('Invalid URL: audioUrl is null or undefined.');
         
-        const response = await axios({ url: variant.audioUrl, responseType: 'arraybuffer' });
+        // PATAISYMAS: Naudojame 'arraybuffer' ir 'fs.writeFile'
+        const response = await axios({
+            url: variant.audioUrl,
+            responseType: 'arraybuffer'
+        });
         await fs.writeFile(originalFilePath, response.data);
         console.log(`[${variantTaskId}] File downloaded successfully.`);
 
-        // 2. Konvertuojame į HLS
+        // 2. Konvertuojame į 30s HLS peržiūrą su FFmpeg
         const hlsOutputPath = path.join(tempDir, 'demo.m3u8');
         console.log(`[${variantTaskId}] Converting to HLS preview...`);
         await new Promise((resolve, reject) => {
@@ -112,7 +128,7 @@ async function processVariant(variant, internalTaskId) {
                 .save(hlsOutputPath);
         });
 
-        // 3. Įkeliame į R2
+        // 3. Įkeliame HLS failus į R2
         console.log(`[${variantTaskId}] Uploading HLS files to R2...`);
         const filesToUpload = await fs.readdir(tempDir);
         for (const file of filesToUpload) {
@@ -129,10 +145,14 @@ async function processVariant(variant, internalTaskId) {
 
         // 4. Grąžiname rezultatą
         return {
-            index: variant.index, title: variant.title, cover: variant.imageUrl,
-            fullUrl: variant.audioUrl, previewR2Path: `previews/${variantTaskId}/demo.m3u8`,
+            index: variant.index,
+            title: variant.title,
+            cover: variant.imageUrl,
+            fullUrl: variant.audioUrl,
+            previewR2Path: `previews/${variantTaskId}/demo.m3u8`,
         };
     } finally {
+        // 5. Išvalome laikinus failus
         await fs.rm(tempDir, { recursive: true, force: true });
         console.log(`[${variantTaskId}] Cleaned up temporary files.`);
     }
