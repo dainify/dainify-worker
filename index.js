@@ -103,7 +103,7 @@ async function processVariant(variant, internalTaskId) {
     const tempDir = await fs.mkdtemp(path.join('/tmp', `song-${variantTaskId}-`));
     
     try {
-        // 1. Atsisiunčiame originalų MP3 failą
+        // 1. Atsisiunčiame originalų MP3 failą kaip dvejetainį buferį
         const originalFilePath = path.join(tempDir, 'original.mp3');
         console.log(`[${variantTaskId}] Downloading from ${variant.audioUrl}`);
         if (!variant.audioUrl) throw new Error('Invalid URL: audioUrl is null or undefined.');
