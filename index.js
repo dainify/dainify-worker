@@ -1,9 +1,9 @@
 /**
- * Dainify Konverteris (pilna ištobulinta versija)
+ * Dainify Konverteris (galutinė versija)
  * - MP3 (audioUrl) ir HLS (streamUrl/m3u8) palaikymas
- * - HLS master -> media pasirinkimas (median bitrate)
- * - Absoliutinami segmentai, KEY/MAP; lokalus .m3u8
- * - 30s HLS preview -> R2 -> callback į Worker'į
+ * - streamUrl gali būti MP3: automatinis probe (default -> MP3)
+ * - HLS master -> media (median bitrate), absoliutinami segmentai/KEY/MAP, lokalus .m3u8
+ * - 30s HLS preview -> R2 -> callback (abu X-Webhook-Secret header'iai)
  * - Concurrency limit, retry, timeout'ai, UA
  */
 
@@ -187,7 +187,7 @@ async function processVariantSafe(variant, internalTaskId) {
   return processVariant(variant, internalTaskId);
 }
 
-/** Normalizatorius: suderina laukus iš įvairių šaltinių */
+/** Normalizatorius */
 function normalizeVariant(raw, i = 0) {
   const audioUrl =
     raw.audioUrl || raw.audio_url || raw.audio_url_mp3 || raw.mp3_url || raw.audio || null;
@@ -219,19 +219,30 @@ async function processVariant(variant, internalTaskId) {
 
     const hlsOutputPath = path.join(tempDir, 'demo.m3u8');
 
-    // Nusprendžiam realų turinio tipą (nes streamUrl gali būti MP3)
+    // Nusprendžiam turinio tipą (streamUrl gali būti MP3)
     let kind = variant.audioUrl ? 'mp3' : 'm3u8';
     if (!variant.audioUrl && variant.streamUrl) {
-      try { kind = await probeUrlType(inputUrl); } catch { kind = 'm3u8'; }
+      try { kind = await probeUrlType(inputUrl); } catch { kind = 'mp3'; } // default -> MP3
     }
 
     if (kind === 'mp3') {
       await mp3ToTrimmedHls(inputUrl, hlsOutputPath, tempDir, variantTaskId);
     } else {
-      await hlsToTrimmedHls(inputUrl, hlsOutputPath, tempDir, variantTaskId);
+      try {
+        await hlsToTrimmedHls(inputUrl, hlsOutputPath, tempDir, variantTaskId);
+      } catch (e) {
+        const msg = String(e?.message || e);
+        // jei HLS paruošimas aptiko MP3 – fallback į MP3 kelią
+        if (/Unexpected content-type for m3u8:\s*audio\/mp3/i.test(msg) || /audio\/mpeg/i.test(msg)) {
+          console.warn(`[${variantTaskId}] HLS looked like MP3 – falling back to MP3 path`);
+          await mp3ToTrimmedHls(inputUrl, hlsOutputPath, tempDir, variantTaskId);
+        } else {
+          throw e;
+        }
+      }
     }
 
-    // Įkeliam visus .m3u8 ir .ts
+    // Įkeliam .m3u8 ir .ts
     console.log(`[${variantTaskId}] Uploading HLS files to R2...`);
     const filesToUpload = await fs.readdir(tempDir);
     await uploadFilesToR2(filesToUpload, tempDir, `previews/${variantTaskId}/`);
@@ -357,7 +368,8 @@ async function probeUrlType(url) {
     if (ct.includes('audio/mp3') || ct.includes('audio/mpeg') || ct === 'application/octet-stream') return 'mp3';
   } catch { /* ignore */ }
 
-  return 'm3u8';
+  // jei dar neaišku – rinkis MP3 (kaip tavo atveju)
+  return 'mp3';
 }
 
 function resolveRelative(base, maybeRel) {
@@ -433,9 +445,15 @@ function absolutizePlaylist(text, baseUrl) {
 async function fetchAndPrepareM3U8(inputUrl, tempDir) {
   const r1 = await httpGet(inputUrl, { responseType: 'text' });
   const ct = (r1.headers['content-type'] || '').toLowerCase();
+
+  // Jei serveris grąžino MP3 – leiskim aukščiau suveikti fallback'ui
+  if (ct.includes('audio/mp3') || ct.includes('audio/mpeg')) {
+    throw new Error('Unexpected content-type for m3u8: audio/mp3');
+  }
   if (!ct.includes('mpegurl') && !String(r1.data).startsWith('#EXTM3U')) {
     throw new Error(`Unexpected content-type for m3u8: ${ct || 'unknown'}`);
   }
+
   let baseUrl = r1.request?.res?.responseUrl || inputUrl;
   let text = r1.data;
 
