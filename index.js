@@ -62,29 +62,58 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/create-preview', verifySecret, async (req, res) => {
-    const { internalTaskId, sunoVariants, customerId } = req.body;
-    if (!internalTaskId || !Array.isArray(sunoVariants) || !customerId) {
-        return res.status(400).send('Bad Request: Missing required payload fields.');
-    }
-    res.status(202).send({ status: 'accepted', message: 'Processing started in the background.' });
+  const { internalTaskId, sunoVariants, customerId } = req.body;
+  if (!internalTaskId || !Array.isArray(sunoVariants) || !customerId) {
+    return res.status(400).send('Bad Request: Missing required payload fields.');
+  }
+  res.status(202).send({ status: 'accepted', message: 'Processing started in the background.' });
 
-    console.log(`[${internalTaskId}] Starting processing for ${sunoVariants.length} variants.`);
-    try {
-        const results = await Promise.allSettled(
-            sunoVariants.map(variant => processVariant(variant, internalTaskId))
-        );
-        const finalItems = results.filter(r => r.status === 'fulfilled').map(r => r.value);
-        if (finalItems.length === 0) {
-            console.error(`[${internalTaskId}] All variants failed. No callback will be sent.`);
-            return;
-        }
-        await axios.post(config.worker.callbackUrl, {
-            mode: 'conversion-complete', customerId, taskId: internalTaskId, finalItems,
-        }, { headers: { 'X-Webhook-Secret': config.worker.callbackSecret } });
-        console.log(`[${internalTaskId}] Successfully processed ${finalItems.length} variant(s) and sent callback.`);
-    } catch (error) {
-        console.error(`[${internalTaskId}] A critical unexpected error occurred:`, error);
+  console.log(`[${internalTaskId}] Starting processing for ${sunoVariants.length} variants.`);
+  try {
+    // normalizuojam visus variantus
+    const normalized = sunoVariants.map((v, i) => normalizeVariant(v, i));
+
+    // ankstyva validacija ir diagnostika
+    const invalids = normalized
+      .map((v, i) => ({ i, ok: !!v.audioUrl, v }))
+      .filter(x => !x.ok);
+    if (invalids.length) {
+      console.warn(`[${internalTaskId}] Variants missing audioUrl:`, invalids.map(x => ({ i: x.i, keys: Object.keys(sunoVariants[x.i] || {}) })));
     }
+
+    const results = await Promise.allSettled(
+      normalized.map(variant => processVariant(variant, internalTaskId))
+    );
+
+    const finalItems = results
+      .filter(r => r.status === 'fulfilled')
+      .map(r => r.value);
+
+    if (finalItems.length === 0) {
+      console.error(`[${internalTaskId}] All variants failed. Sending failure callback.`);
+      // SIŲSK bent „failure“ callback’ą su klaidų priežastimis, kad Worker’is galėtų rodyti UI žinutę
+      await axios.post(config.worker.callbackUrl, {
+        mode: 'conversion-failed',
+        customerId,
+        taskId: internalTaskId,
+        errs: results.map((r, i) =>
+          r.status === 'rejected' ? { index: i, error: r.reason?.message || String(r.reason) } : null
+        ).filter(Boolean)
+      }, { headers: { 'X-Webhook-Secret': config.worker.callbackSecret } }).catch(() => {});
+      return;
+    }
+
+    await axios.post(config.worker.callbackUrl, {
+      mode: 'conversion-complete',
+      customerId,
+      taskId: internalTaskId,
+      finalItems,
+    }, { headers: { 'X-Webhook-Secret': config.worker.callbackSecret } });
+
+    console.log(`[${internalTaskId}] Successfully processed ${finalItems.length} variant(s) and sent callback.`);
+  } catch (error) {
+    console.error(`[${internalTaskId}] A critical unexpected error occurred:`, error);
+  }
 });
 
 app.listen(config.port, () => {
@@ -98,62 +127,93 @@ app.listen(config.port, () => {
  * @param {string} internalTaskId - Vidinis užduoties ID.
  * @returns {Promise<object>} Objektas su informacija apie sukurtą peržiūrą.
  */
+// processVariant() pradžia (pakeitimai pažymėti)
 async function processVariant(variant, internalTaskId) {
-    const variantTaskId = `${internalTaskId}-${variant.index}`;
-    const tempDir = await fs.mkdtemp(path.join('/tmp', `song-${variantTaskId}-`));
-    
-    try {
-        // 1. Atsisiunčiame originalų MP3 failą kaip dvejetainį buferį
-        const originalFilePath = path.join(tempDir, 'original.mp3');
-        console.log(`[${variantTaskId}] Downloading from ${variant.audioUrl}`);
-        if (!variant.audioUrl) throw new Error('Invalid URL: audioUrl is null or undefined.');
-        
-        // PATAISYMAS: Naudojame 'arraybuffer' ir 'fs.writeFile'
-        const response = await axios({
-            url: variant.audioUrl,
-            responseType: 'arraybuffer'
-        });
-        await fs.writeFile(originalFilePath, response.data);
-        console.log(`[${variantTaskId}] File downloaded successfully.`);
+  const variantTaskId = `${internalTaskId}-${variant.index}`;
+  const tempDir = await fs.mkdtemp(path.join('/tmp', `song-${variantTaskId}-`));
+  try {
+    const originalFilePath = path.join(tempDir, 'original.mp3');
 
-        // 2. Konvertuojame į 30s HLS peržiūrą su FFmpeg
-        const hlsOutputPath = path.join(tempDir, 'demo.m3u8');
-        console.log(`[${variantTaskId}] Converting to HLS preview...`);
-        await new Promise((resolve, reject) => {
-            Ffmpeg(originalFilePath)
-                .setStartTime(0).duration(30)
-                .outputOptions(['-f hls', '-hls_time 10', '-hls_list_size 0', '-hls_segment_filename', `${tempDir}/segment%03d.ts`])
-                .on('end', resolve)
-                .on('error', (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
-                .save(hlsOutputPath);
-        });
+    // NEW: palaikyk ir HLS m3u8
+    const inputUrl = variant.audioUrl || variant.streamUrl;
+    if (!inputUrl) throw new Error('Invalid URL: both audioUrl and streamUrl are missing.');
+    console.log(`[${variantTaskId}] Downloading from ${inputUrl}`);
 
-        // 3. Įkeliame HLS failus į R2
-        console.log(`[${variantTaskId}] Uploading HLS files to R2...`);
-        const filesToUpload = await fs.readdir(tempDir);
-        for (const file of filesToUpload) {
-            if (file.endsWith('.m3u8') || file.endsWith('.ts')) {
-                const filePath = path.join(tempDir, file);
-                const fileContent = await fs.readFile(filePath);
-                const r2Key = `previews/${variantTaskId}/${file}`;
-                await s3Client.send(new PutObjectCommand({
-                    Bucket: config.r2.bucketName, Key: r2Key, Body: fileContent,
-                    ContentType: file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t',
-                }));
-            }
-        }
+    if (variant.audioUrl) {
+      // kaip buvo: MP3 parsisiuntimas
+      const response = await axios({ url: inputUrl, responseType: 'arraybuffer', timeout: 30000 });
+      await fs.writeFile(originalFilePath, response.data);
+      console.log(`[${variantTaskId}] File downloaded successfully.`);
 
-        // 4. Grąžiname rezultatą
-        return {
-            index: variant.index,
-            title: variant.title,
-            cover: variant.imageUrl,
-            fullUrl: variant.audioUrl,
-            previewR2Path: `previews/${variantTaskId}/demo.m3u8`,
-        };
-    } finally {
-        // 5. Išvalome laikinus failus
-        await fs.rm(tempDir, { recursive: true, force: true });
-        console.log(`[${variantTaskId}] Cleaned up temporary files.`);
+      // Konvertuojam į 30s HLS
+      const hlsOutputPath = path.join(tempDir, 'demo.m3u8');
+      console.log(`[${variantTaskId}] Converting MP3 -> HLS preview...`);
+      await new Promise((resolve, reject) => {
+        Ffmpeg(originalFilePath)
+          .setStartTime(0).duration(30)
+          .outputOptions([
+            '-f hls',
+            '-hls_time 10',
+            '-hls_list_size 0',
+            '-hls_segment_filename', path.join(tempDir, 'segment%03d.ts')
+          ])
+          .on('end', resolve)
+          .on('error', err => reject(new Error(`FFmpeg error: ${err.message}`)))
+          .save(hlsOutputPath);
+      });
+
+    } else {
+      // NEW: turime tik HLS m3u8 – duokim m3u8 tiesiai į FFmpeg ir persugeneruokim savo 30s HLS
+      const hlsOutputPath = path.join(tempDir, 'demo.m3u8');
+      console.log(`[${variantTaskId}] Transcoding HLS (m3u8) -> trimmed HLS preview...`);
+      await new Promise((resolve, reject) => {
+        Ffmpeg(inputUrl)
+          .inputOptions([
+            // kartais prireikia, kai m3u8 traukia segmentus per https
+            '-protocol_whitelist', 'file,http,https,tcp,tls'
+          ])
+          .setStartTime(0).duration(30)
+          .outputOptions([
+            '-f hls',
+            '-hls_time 10',
+            '-hls_list_size 0',
+            '-hls_segment_filename', path.join(tempDir, 'segment%03d.ts')
+          ])
+          .on('end', resolve)
+          .on('error', err => reject(new Error(`FFmpeg HLS error: ${err.message}`)))
+          .save(hlsOutputPath);
+      });
     }
+
+    // Įkėlimas į R2 – paliekam kaip yra
+    console.log(`[${variantTaskId}] Uploading HLS files to R2...`);
+    const filesToUpload = await fs.readdir(tempDir);
+    for (const file of filesToUpload) {
+      if (file.endsWith('.m3u8') || file.endsWith('.ts')) {
+        const filePath = path.join(tempDir, file);
+        const fileContent = await fs.readFile(filePath);
+        const r2Key = `previews/${variantTaskId}/${file}`;
+        await s3Client.send(new PutObjectCommand({
+          Bucket: config.r2.bucketName,
+          Key: r2Key,
+          Body: fileContent,
+          ContentType: file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t',
+        }));
+      }
+    }
+
+    return {
+      index: variant.index,
+      title: variant.title,
+      cover: variant.imageUrl,
+      fullUrl: variant.audioUrl || null,      // MP3, jei buvo
+      previewR2Path: `previews/${variantTaskId}/demo.m3u8`,
+    };
+  } catch (e) {
+    console.error(`[${variantTaskId}] Failed: ${e.message}`);
+    throw e;
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+    console.log(`[${variantTaskId}] Cleaned up temporary files.`);
+  }
 }
