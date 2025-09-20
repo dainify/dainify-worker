@@ -1,10 +1,10 @@
 /**
- * Dainify Konverteris (maksimaliai ištobulinta versija)
- * - Priima MP3 (audioUrl) ir HLS (streamUrl/m3u8) variantus
- * - Iš HLS master parenka vieną MEDIA playlistą (protingai – „vidurinį“ pagal BW)
- * - Absoliutina segmentų ir KEY/MAP URL'us, rašo lokalų .m3u8
- * - Trim'ina iki 30 s su FFmpeg, kelia į R2, siunčia callback į Worker'į
- * - Tvirtas retry/timeout/headers, konkurentiškumo limiteris
+ * Dainify Konverteris (pilna ištobulinta versija)
+ * - MP3 (audioUrl) ir HLS (streamUrl/m3u8) palaikymas
+ * - HLS master -> media pasirinkimas (median bitrate)
+ * - Absoliutinami segmentai, KEY/MAP; lokalus .m3u8
+ * - 30s HLS preview -> R2 -> callback į Worker'į
+ * - Concurrency limit, retry, timeout'ai, UA
  */
 
 import express from 'express';
@@ -31,6 +31,7 @@ const config = {
     callbackSecret: process.env.WORKER_CALLBACK_SECRET,
   },
   webhookSecret: process.env.WEBHOOK_SECRET,
+
   // techniniai:
   maxConcurrent: Number(process.env.MAX_CONCURRENT || 2),
   ffmpegTrimSeconds: Number(process.env.TRIM_SECONDS || 30),
@@ -55,7 +56,7 @@ const s3Client = new S3Client({
   },
 });
 
-// Axios basic defaults
+// Axios defaults
 const AXIOS_DEFAULTS = {
   timeout: config.requestTimeoutMs,
   maxRedirects: 5,
@@ -92,7 +93,7 @@ app.post('/create-preview', verifySecret, async (req, res) => {
     return res.status(400).send('Bad Request: Missing required payload fields.');
   }
 
-  // quick ack
+  // greitas ack
   res.status(202).send({ status: 'accepted', message: 'Processing started in the background.' });
 
   console.log(`[${internalTaskId}] Starting processing for ${sunoVariants.length} variants.`);
@@ -105,9 +106,8 @@ app.post('/create-preview', verifySecret, async (req, res) => {
     console.warn(`[${internalTaskId}] Variants missing audioUrl/streamUrl:`, invalids);
   }
 
-  // limit concurrency
+  // concurrency limit
   const limit = pLimit(config.maxConcurrent);
-
   const results = await Promise.allSettled(
     normalized.map(variant => limit(() => processVariantSafe(variant, internalTaskId)))
   );
@@ -120,10 +120,13 @@ app.post('/create-preview', verifySecret, async (req, res) => {
       mode: 'conversion-failed',
       customerId,
       taskId: internalTaskId,
-      errs: results.map((r, i) =>
-        r.status === 'rejected' ? { index: i, error: r.reason?.message || String(r.reason) } : null
-      ).filter(Boolean)
-    }, { headers: { 'X-Webhook-Secret': config.worker.callbackSecret }, timeout: config.callbackTimeoutMs });
+      errs: results.map((r, i) => r.status === 'rejected'
+        ? { index: i, error: r.reason?.message || String(r.reason) }
+        : null).filter(Boolean)
+    }, {
+      headers: bothSecrets(config.worker.callbackSecret),
+      timeout: config.callbackTimeoutMs
+    });
     return;
   }
 
@@ -132,7 +135,10 @@ app.post('/create-preview', verifySecret, async (req, res) => {
     customerId,
     taskId: internalTaskId,
     finalItems,
-  }, { headers: { 'X-Webhook-Secret': config.worker.callbackSecret }, timeout: config.callbackTimeoutMs });
+  }, {
+    headers: bothSecrets(config.worker.callbackSecret),
+    timeout: config.callbackTimeoutMs
+  });
 
   console.log(`[${internalTaskId}] Successfully processed ${finalItems.length} variant(s) and sent callback.`);
 });
@@ -153,7 +159,7 @@ process.on('SIGINT', () => server.close(() => process.exit(0)));
 
 /* ===================== CORE FUNKCIJOS ===================== */
 
-/** Limitatorius (mini p-limit) */
+/** Mini p-limit */
 function pLimit(concurrency = 2) {
   const queue = [];
   let active = 0;
@@ -174,7 +180,6 @@ function pLimit(concurrency = 2) {
   });
 }
 
-/** Saugesnis processVariant su aiškesne klaida */
 async function processVariantSafe(variant, internalTaskId) {
   if (!variant || (!variant.audioUrl && !variant.streamUrl)) {
     throw new Error('Variant missing audioUrl/streamUrl');
@@ -214,11 +219,15 @@ async function processVariant(variant, internalTaskId) {
 
     const hlsOutputPath = path.join(tempDir, 'demo.m3u8');
 
-    if (variant.audioUrl) {
-      // MP3 -> HLS
+    // Nusprendžiam realų turinio tipą (nes streamUrl gali būti MP3)
+    let kind = variant.audioUrl ? 'mp3' : 'm3u8';
+    if (!variant.audioUrl && variant.streamUrl) {
+      try { kind = await probeUrlType(inputUrl); } catch { kind = 'm3u8'; }
+    }
+
+    if (kind === 'mp3') {
       await mp3ToTrimmedHls(inputUrl, hlsOutputPath, tempDir, variantTaskId);
     } else {
-      // HLS -> HLS (lokaliai paruoštas .m3u8)
       await hlsToTrimmedHls(inputUrl, hlsOutputPath, tempDir, variantTaskId);
     }
 
@@ -246,10 +255,7 @@ async function processVariant(variant, internalTaskId) {
 /* ===== MP3 -> 30s HLS ===== */
 async function mp3ToTrimmedHls(mp3Url, hlsOutPath, tempDir, variantTaskId) {
   const originalFilePath = path.join(tempDir, 'original.mp3');
-  const r = await axios.get(mp3Url, {
-    ...AXIOS_DEFAULTS,
-    responseType: 'arraybuffer',
-  });
+  const r = await axios.get(mp3Url, { ...AXIOS_DEFAULTS, responseType: 'arraybuffer' });
   await fs.writeFile(originalFilePath, r.data);
   console.log(`[${variantTaskId}] MP3 downloaded (${(r.data?.length ?? 0) / 1024 | 0} KiB).`);
 
@@ -321,33 +327,37 @@ async function hlsToTrimmedHls(hlsUrl, hlsOutPath, tempDir, variantTaskId) {
   }
 }
 
-/* ===== R2 Upload helper ===== */
-async function uploadFilesToR2(files, baseDir, prefix) {
-  // šiek tiek ribojam paralelę
-  const limit = pLimit(4);
-  await Promise.all(
-    files
-      .filter(f => f.endsWith('.m3u8') || f.endsWith('.ts'))
-      .map(file => limit(async () => {
-        const filePath = path.join(baseDir, file);
-        const buf = await fs.readFile(filePath);
-        const key = `${prefix}${file}`;
-        const ct = file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t';
-        await s3Client.send(new PutObjectCommand({
-          Bucket: config.r2.bucketName,
-          Key: key,
-          Body: buf,
-          ContentType: ct,
-        }));
-      }))
-  );
-}
-
 /* ===================== HLS/M3U8 PARUOŠIMAS ===================== */
 
 async function httpGet(url, opts = {}) {
   const r = await axios.get(url, { ...AXIOS_DEFAULTS, ...opts });
   return r;
+}
+
+async function probeUrlType(url) {
+  // HEAD
+  try {
+    const r = await axios.head(url, AXIOS_DEFAULTS);
+    const ct = (r.headers['content-type'] || '').toLowerCase();
+    if (ct.includes('mpegurl')) return 'm3u8';
+    if (ct.includes('audio/mp3') || ct.includes('audio/mpeg') || ct === 'application/octet-stream') return 'mp3';
+  } catch { /* ignore */ }
+
+  // mini GET (iki 256 KB) – kad pamatytume #EXTM3U
+  try {
+    const r = await axios.get(url, {
+      ...AXIOS_DEFAULTS,
+      responseType: 'arraybuffer',
+      maxContentLength: 256 * 1024
+    });
+    const ct = (r.headers['content-type'] || '').toLowerCase();
+    const buf = Buffer.from(r.data || []);
+    const head = buf.subarray(0, 16).toString('utf8');
+    if (ct.includes('mpegurl') || head.startsWith('#EXTM3U')) return 'm3u8';
+    if (ct.includes('audio/mp3') || ct.includes('audio/mpeg') || ct === 'application/octet-stream') return 'mp3';
+  } catch { /* ignore */ }
+
+  return 'm3u8';
 }
 
 function resolveRelative(base, maybeRel) {
@@ -357,7 +367,6 @@ const isMasterPlaylist = (text) => /#EXT-X-STREAM-INF/i.test(text);
 const isMediaPlaylist = (text) => /#EXTINF:/i.test(text);
 
 function parseVariantsFromMaster(text, baseUrl) {
-  // surenkam {bandwidth, url}
   const lines = text.split(/\r?\n/);
   const variants = [];
   for (let i = 0; i < lines.length; i++) {
@@ -389,20 +398,18 @@ function pickMedianVariant(variants) {
 }
 
 function absolutizePlaylist(text, baseUrl) {
-  // Absoliutiname TS/MP4 segmentų eilutes, KEY ir MAP URI
+  // Absoliutinam segmentus ir KEY/MAP URI
   const lines = text.split(/\r?\n/);
   const out = [];
   for (let i = 0; i < lines.length; i++) {
     let ln = lines[i];
 
-    // #EXT-X-KEY:METHOD=AES-128,URI="key.key"
     if (/^#EXT-X-KEY/i.test(ln)) {
       ln = ln.replace(/URI="([^"]+)"/i, (_m, g1) => `URI="${resolveRelative(baseUrl, g1)}"`);
       out.push(ln);
       continue;
     }
 
-    // #EXT-X-MAP:URI="init.mp4"
     if (/^#EXT-X-MAP/i.test(ln)) {
       ln = ln.replace(/URI="([^"]+)"/i, (_m, g1) => `URI="${resolveRelative(baseUrl, g1)}"`);
       out.push(ln);
@@ -415,7 +422,6 @@ function absolutizePlaylist(text, baseUrl) {
       out.push(resolveRelative(baseUrl, ln.trim()));
     }
   }
-  // pasirūpinam ENDLIST
   if (!out.find(l => /^#EXT-X-ENDLIST/i.test(l))) out.push('#EXT-X-ENDLIST');
   return out.join('\n');
 }
@@ -425,7 +431,6 @@ function absolutizePlaylist(text, baseUrl) {
  * Absoliutina URL’us ir įrašo lokalų .m3u8 failą.
  */
 async function fetchAndPrepareM3U8(inputUrl, tempDir) {
-  // 1) parsisiunčiam
   const r1 = await httpGet(inputUrl, { responseType: 'text' });
   const ct = (r1.headers['content-type'] || '').toLowerCase();
   if (!ct.includes('mpegurl') && !String(r1.data).startsWith('#EXTM3U')) {
@@ -434,7 +439,6 @@ async function fetchAndPrepareM3U8(inputUrl, tempDir) {
   let baseUrl = r1.request?.res?.responseUrl || inputUrl;
   let text = r1.data;
 
-  // 2) master? – rinktis media
   if (isMasterPlaylist(text)) {
     const variants = parseVariantsFromMaster(text, baseUrl);
     const pick = pickMedianVariant(variants) || variants[0];
@@ -447,10 +451,7 @@ async function fetchAndPrepareM3U8(inputUrl, tempDir) {
     }
   }
 
-  // 3) absoliutinam
   const abs = absolutizePlaylist(text, baseUrl);
-
-  // 4) į failą
   const localPath = path.join(tempDir, 'source.m3u8');
   await fs.writeFile(localPath, abs, 'utf8');
   return { localPath };
@@ -458,12 +459,36 @@ async function fetchAndPrepareM3U8(inputUrl, tempDir) {
 
 /* ===================== BENDROSIOS PAGALBINĖS ===================== */
 
+async function uploadFilesToR2(files, baseDir, prefix) {
+  const limit = pLimit(4);
+  await Promise.all(
+    files
+      .filter(f => f.endsWith('.m3u8') || f.endsWith('.ts'))
+      .map(file => limit(async () => {
+        const filePath = path.join(baseDir, file);
+        const buf = await fs.readFile(filePath);
+        const key = `${prefix}${file}`;
+        const ct = file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t';
+        await s3Client.send(new PutObjectCommand({
+          Bucket: config.r2.bucketName,
+          Key: key,
+          Body: buf,
+          ContentType: ct,
+        }));
+      }))
+  );
+}
+
 async function safePost(url, data, opts = {}) {
   try {
     await axios.post(url, data, { ...opts });
   } catch (e) {
     console.error('Callback POST failed:', e?.message || e);
   }
+}
+
+function bothSecrets(secret) {
+  return { 'X-Webhook-Secret': secret, 'x-webhook-secret': secret };
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -477,7 +502,5 @@ function validateEnv(cfg) {
   if (!cfg.worker.callbackUrl) miss.push('WORKER_CALLBACK_URL');
   if (!cfg.worker.callbackSecret) miss.push('WORKER_CALLBACK_SECRET');
   if (!cfg.webhookSecret) miss.push('WEBHOOK_SECRET');
-  if (miss.length) {
-    console.warn('⚠️ Missing env vars:', miss.join(', '));
-  }
+  if (miss.length) console.warn('⚠️ Missing env vars:', miss.join(', '));
 }
