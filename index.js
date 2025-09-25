@@ -1,11 +1,9 @@
 /**
- * Dainify Konverteris (galutinė versija) — with R2/stream preview switch
- * - MP3 (audioUrl) ir HLS (streamUrl/m3u8) palaikymas
- * - streamUrl gali būti MP3: automatinis probe (default -> MP3)
- * - HLS master -> media (median bitrate), absoliutinami segmentai/KEY/MAP, lokalus .m3u8
- * - 30s HLS preview -> R2 -> callback (abu X-Webhook-Secret header'iai)
- * - Concurrency limit, retry, timeout'ai, UA
- * - PREVIEW_SOURCE switch: "stream" (legacy Suno) | "r2" (private R2 via signed Worker URL)
+ * Dainify Konverteris (fixed, worker-compatible signing)
+ * - MP3 and HLS inputs → 30s HLS preview
+ * - Uploads demo.m3u8 + .ts to R2 under: previews/<internalTaskId>-<index>/
+ * - Sends callback to Worker with previewR2Path
+ * - OPTIONAL: If PREVIEW_SOURCE=r2, builds Worker-style signed /preview URL (ms exp + hex HMAC "<path>.<expMs>")
  */
 
 import express from 'express';
@@ -18,7 +16,7 @@ import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
 
-/* ===================== KONFIGŪRACIJA ===================== */
+/* ===================== CONFIG ===================== */
 
 const config = {
   port: Number(process.env.PORT || 10000),
@@ -34,29 +32,29 @@ const config = {
   },
   webhookSecret: process.env.WEBHOOK_SECRET,
 
-  // nauja: perjungiklis ir tokenizavimas privačiam R2 peržiūrai
+  // Preview via private R2 through the Worker’s /preview route
   preview: {
-    // 'stream' (dabartinis Suno srautas) arba 'r2' (30s demo iš privačios R2 per Worker)
+    // "stream" (fallback to Suno stream) | "r2" (prefer private R2 via Worker-signed URL)
     source: process.env.PREVIEW_SOURCE || 'stream',
-    // Cloudflare Worker bazinis URL be trailing slash, pvz.: https://src.dainifystore.workers.dev/preview
+    // Worker base URL pointing at /preview, e.g. https://your-worker.workers.dev/preview
     r2ProxyBase: process.env.R2_PROXY_BASE,
-    // HMAC pasirašymo paslaptis (turi sutapti su Worker)
+    // must match Worker’s PREVIEW_TOKEN_SECRET
     tokenSecret: process.env.PREVIEW_TOKEN_SECRET,
-    // nuorodos galiojimo laikas dienomis
+    // ms TTL will be computed from days below
     tokenTtlDays: Number(process.env.PREVIEW_TOKEN_TTL_DAYS || 30),
   },
 
-  // techniniai:
+  // tech knobs
   maxConcurrent: Number(process.env.MAX_CONCURRENT || 2),
   ffmpegTrimSeconds: Number(process.env.TRIM_SECONDS || 30),
-  hlsSegmentSeconds: Number(process.env.HLS_SEGMENT_SECONDS || 10),
+  hlsSegmentSeconds: Number(process.env.HLS_SEGMENT_SECONDS || 4),
   requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS || 20000),
   callbackTimeoutMs: Number(process.env.CALLBACK_TIMEOUT_MS || 10000),
 };
 
 validateEnv(config);
 
-// ffmpeg kelias
+// ffmpeg path
 Ffmpeg.setFfmpegPath(ffmpegStatic);
 
 // R2 S3 client
@@ -107,7 +105,7 @@ app.post('/create-preview', verifySecret, async (req, res) => {
     return res.status(400).send('Bad Request: Missing required payload fields.');
   }
 
-  // greitas ack
+  // quick ack
   res.status(202).send({ status: 'accepted', message: 'Processing started in the background.' });
 
   console.log(`[${internalTaskId}] Starting processing for ${sunoVariants.length} variants.`);
@@ -120,13 +118,14 @@ app.post('/create-preview', verifySecret, async (req, res) => {
     console.warn(`[${internalTaskId}] Variants missing audioUrl/streamUrl:`, invalids);
   }
 
-  // concurrency limit
   const limit = pLimit(config.maxConcurrent);
   const results = await Promise.allSettled(
     normalized.map((variant) => limit(() => processVariantSafe(variant, internalTaskId)))
   );
 
-  const finalItems = results.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+  const finalItems = results
+    .map((r) => (r.status === 'fulfilled' ? r.value : null))
+    .filter(Boolean);
 
   if (finalItems.length === 0) {
     console.error(`[${internalTaskId}] All variants failed. Sending failure callback.`);
@@ -142,26 +141,15 @@ app.post('/create-preview', verifySecret, async (req, res) => {
           )
           .filter(Boolean),
       },
-      {
-        headers: bothSecrets(config.worker.callbackSecret),
-        timeout: config.callbackTimeoutMs,
-      }
+      { headers: bothSecrets(config.worker.callbackSecret), timeout: config.callbackTimeoutMs }
     );
     return;
   }
 
   await safePost(
     config.worker.callbackUrl,
-    {
-      mode: 'conversion-complete',
-      customerId,
-      taskId: internalTaskId,
-      finalItems,
-    },
-    {
-      headers: bothSecrets(config.worker.callbackSecret),
-      timeout: config.callbackTimeoutMs,
-    }
+    { mode: 'conversion-complete', customerId, taskId: internalTaskId, finalItems },
+    { headers: bothSecrets(config.worker.callbackSecret), timeout: config.callbackTimeoutMs }
   );
 
   console.log(`[${internalTaskId}] Successfully processed ${finalItems.length} variant(s) and sent callback.`);
@@ -181,9 +169,8 @@ const server = app.listen(config.port, () => {
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
 process.on('SIGINT', () => server.close(() => process.exit(0)));
 
-/* ===================== CORE FUNKCIJOS ===================== */
+/* ===================== CORE ===================== */
 
-/** Mini p-limit */
 function pLimit(concurrency = 2) {
   const queue = [];
   let active = 0;
@@ -220,44 +207,34 @@ async function processVariantSafe(variant, internalTaskId) {
   return processVariant(variant, internalTaskId);
 }
 
-/** Normalizatorius */
 function normalizeVariant(raw, i = 0) {
   const audioUrl = raw.audioUrl || raw.audio_url || raw.audio_url_mp3 || raw.mp3_url || raw.audio || null;
-
   const streamUrl =
     raw.streamUrl || raw.stream_url || raw.hls_url || raw.m3u8_url || raw.audio_hls || raw.hls || null;
-
   const imageUrl =
     raw.imageUrl || raw.image_url || raw.cover_image_url || raw.cover || raw.thumbnail_url || raw.image || null;
-
   const title = raw.title || raw.name || raw.track_title || `Song Variant ${i + 1}`;
-
   const index = typeof raw.index === 'number' ? raw.index : typeof raw.id === 'number' ? raw.id : i;
 
   return { audioUrl, streamUrl, imageUrl, title, index };
 }
 
-/** HMAC token helpers for private R2 preview via Worker */
-function base64url(buf) {
-  return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+/** Worker-style signing helpers (MATCHES your Worker) */
+function hmacHex(secret, msg) {
+  return crypto.createHmac('sha256', secret).update(msg).digest('hex'); // hex, lowercase
 }
-function makePreviewToken(pathWithinPreview, secret, expTs) {
-  // token = base64url(HMAC_SHA256(secret, `${expTs}:${path}`))
-  const msg = `${expTs}:${pathWithinPreview}`;
-  const sig = crypto.createHmac('sha256', secret).update(msg).digest();
-  return base64url(sig);
-}
-function buildR2ProxyUrl(r2ProxyBase, pathWithinPreview, secret, ttlDays) {
-  // Worker route example: https://<worker>/preview/<path>
-  const exp = Math.floor(Date.now() / 1000) + ttlDays * 24 * 60 * 60;
-  const token = makePreviewToken(pathWithinPreview, secret, exp);
-  const u = new URL(r2ProxyBase.replace(/\/+$/, '') + '/' + pathWithinPreview);
-  u.searchParams.set('exp', String(exp));
+function buildWorkerStyleSignedUrl(workerPreviewBase, pathWithinPreview, secret, ttlDays) {
+  // exp in MILLISECONDS; msg = "<path>.<expMs>"; token = hex(HMAC_SHA256(secret, msg))
+  const expMs = Date.now() + ttlDays * 24 * 60 * 60 * 1000;
+  const msg = `${pathWithinPreview}.${expMs}`;
+  const token = hmacHex(secret, msg);
+  const u = new URL(workerPreviewBase.replace(/\/+$/, '') + '/' + pathWithinPreview);
+  u.searchParams.set('exp', String(expMs));
   u.searchParams.set('token', token);
   return u.toString();
 }
 
-/** Pagrindinis apdorojimas vienam variantui */
+/** Main processing for a variant */
 async function processVariant(variant, internalTaskId) {
   const variantTaskId = `${internalTaskId}-${variant.index}`;
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), `song-${variantTaskId}-`));
@@ -268,14 +245,14 @@ async function processVariant(variant, internalTaskId) {
 
     const hlsOutputPath = path.join(tempDir, 'demo.m3u8');
 
-    // Nusprendžiam turinio tipą (streamUrl gali būti MP3)
+    // decide input kind (streamUrl may be MP3)
     let kind = variant.audioUrl ? 'mp3' : 'm3u8';
     if (!variant.audioUrl && variant.streamUrl) {
       try {
         kind = await probeUrlType(inputUrl);
       } catch {
         kind = 'mp3';
-      } // default -> MP3
+      }
     }
 
     if (kind === 'mp3') {
@@ -285,7 +262,6 @@ async function processVariant(variant, internalTaskId) {
         await hlsToTrimmedHls(inputUrl, hlsOutputPath, tempDir, variantTaskId);
       } catch (e) {
         const msg = String(e?.message || e);
-        // jei HLS paruošimas aptiko MP3 – fallback į MP3 kelią
         if (/Unexpected content-type for m3u8:\s*audio\/mp3/i.test(msg) || /audio\/mpeg/i.test(msg)) {
           console.warn(`[${variantTaskId}] HLS looked like MP3 – falling back to MP3 path`);
           await mp3ToTrimmedHls(inputUrl, hlsOutputPath, tempDir, variantTaskId);
@@ -295,46 +271,42 @@ async function processVariant(variant, internalTaskId) {
       }
     }
 
-    // Įkeliam .m3u8 ir .ts
+    // upload .m3u8 and .ts
     console.log(`[${variantTaskId}] Uploading HLS files to R2...`);
     const filesToUpload = await fs.readdir(tempDir);
     await uploadFilesToR2(filesToUpload, tempDir, `previews/${variantTaskId}/`);
 
-    // --- NEW: decide which preview URL to expose to frontend/callback ---
     const previewR2Path = `previews/${variantTaskId}/demo.m3u8`;
 
-    let previewUrl;
+    // Preferred flow: let the Worker sign on-demand.
+    // But if PREVIEW_SOURCE=r2 and you WANT to emit a signed URL here, do it matching Worker logic:
+    let previewUrl = variant.streamUrl || variant.audioUrl || null;
     if (
       config.preview.source === 'r2' &&
       config.preview.r2ProxyBase &&
       config.preview.tokenSecret &&
       config.preview.tokenTtlDays > 0
     ) {
-      // private R2 via Worker (signed URL)
-      previewUrl = buildR2ProxyUrl(
-        config.preview.r2ProxyBase,
-        previewR2Path,
+      previewUrl = buildWorkerStyleSignedUrl(
+        config.preview.r2ProxyBase, // should be ".../preview"
+        previewR2Path,              // path inside /preview/<path>
         config.preview.tokenSecret,
         config.preview.tokenTtlDays
       );
-    } else {
-      // legacy behavior: use original Suno stream if available, else audioUrl
-      previewUrl = variant.streamUrl || variant.audioUrl || null;
-      if (config.preview.source === 'r2') {
-        console.warn(
-          `[${variantTaskId}] PREVIEW_SOURCE=r2 but missing R2_PROXY_BASE or PREVIEW_TOKEN_SECRET → falling back to stream/audio`
-        );
-      }
+    } else if (config.preview.source === 'r2') {
+      console.warn(
+        `[${variantTaskId}] PREVIEW_SOURCE=r2 but missing R2_PROXY_BASE or PREVIEW_TOKEN_SECRET → falling back to stream/audio`
+      );
     }
 
     return {
       index: variant.index,
       title: variant.title,
       cover: variant.imageUrl || null,
-      fullUrl: variant.audioUrl || null,
-      previewR2Path, // for debugging/ops
-      previewUrl, // <- frontend will use this
-      taskId: variantTaskId, // preserve for frontend flows that expect it
+      fullUrl: variant.audioUrl || null,   // full mp3 if available; Worker will still handle unlock flow
+      previewR2Path,                       // stored by Worker; used to build signed /preview URLs
+      previewUrl,                          // convenience for clients; Worker may override with its own signer
+      taskId: variantTaskId,
     };
   } catch (e) {
     console.error(`[${variantTaskId}] Failed: ${e.message}`);
@@ -376,7 +348,7 @@ async function mp3ToTrimmedHls(mp3Url, hlsOutPath, tempDir, variantTaskId) {
   });
 }
 
-/* ===== HLS -> 30s HLS (su m3u8 paruošimu) ===== */
+/* ===== HLS -> 30s HLS ===== */
 async function hlsToTrimmedHls(hlsUrl, hlsOutPath, tempDir, variantTaskId) {
   let attempts = 0;
   while (true) {
@@ -393,7 +365,7 @@ async function hlsToTrimmedHls(hlsUrl, hlsOutPath, tempDir, variantTaskId) {
             '-user_agent',
             AXIOS_DEFAULTS.headers['User-Agent'],
             '-rw_timeout',
-            '15000000', // ~15s mikrosekundėmis
+            '15000000',
           ])
           .setStartTime(0)
           .duration(config.ffmpegTrimSeconds)
@@ -425,7 +397,7 @@ async function hlsToTrimmedHls(hlsUrl, hlsOutPath, tempDir, variantTaskId) {
   }
 }
 
-/* ===================== HLS/M3U8 PARUOŠIMAS ===================== */
+/* ===================== HLS/M3U8 PREP ===================== */
 
 async function httpGet(url, opts = {}) {
   const r = await axios.get(url, { ...AXIOS_DEFAULTS, ...opts });
@@ -433,17 +405,13 @@ async function httpGet(url, opts = {}) {
 }
 
 async function probeUrlType(url) {
-  // HEAD
   try {
     const r = await axios.head(url, AXIOS_DEFAULTS);
     const ct = (r.headers['content-type'] || '').toLowerCase();
     if (ct.includes('mpegurl')) return 'm3u8';
     if (ct.includes('audio/mp3') || ct.includes('audio/mpeg') || ct === 'application/octet-stream') return 'mp3';
-  } catch {
-    /* ignore */
-  }
+  } catch {}
 
-  // mini GET (iki 256 KB) – kad pamatytume #EXTM3U
   try {
     const r = await axios.get(url, {
       ...AXIOS_DEFAULTS,
@@ -455,11 +423,8 @@ async function probeUrlType(url) {
     const head = buf.subarray(0, 16).toString('utf8');
     if (ct.includes('mpegurl') || head.startsWith('#EXTM3U')) return 'm3u8';
     if (ct.includes('audio/mp3') || ct.includes('audio/mpeg') || ct === 'application/octet-stream') return 'mp3';
-  } catch {
-    /* ignore */
-  }
+  } catch {}
 
-  // jei dar neaišku – rinkis MP3 (kaip tavo atveju)
   return 'mp3';
 }
 
@@ -505,7 +470,6 @@ function pickMedianVariant(variants) {
 }
 
 function absolutizePlaylist(text, baseUrl) {
-  // Absoliutinam segmentus ir KEY/MAP URI
   const lines = text.split(/\r?\n/);
   const out = [];
   for (let i = 0; i < lines.length; i++) {
@@ -533,15 +497,10 @@ function absolutizePlaylist(text, baseUrl) {
   return out.join('\n');
 }
 
-/**
- * Parsisiunčia HLS (master ar media). Jei master – paima „median BW“ variantą.
- * Absoliutina URL’us ir įrašo lokalų .m3u8 failą.
- */
 async function fetchAndPrepareM3U8(inputUrl, tempDir) {
   const r1 = await httpGet(inputUrl, { responseType: 'text' });
   const ct = (r1.headers['content-type'] || '').toLowerCase();
 
-  // Jei serveris grąžino MP3 – leiskim aukščiau suveikti fallback'ui
   if (ct.includes('audio/mp3') || ct.includes('audio/mpeg')) {
     throw new Error('Unexpected content-type for m3u8: audio/mp3');
   }
@@ -570,7 +529,7 @@ async function fetchAndPrepareM3U8(inputUrl, tempDir) {
   return { localPath };
 }
 
-/* ===================== BENDROSIOS PAGALBINĖS ===================== */
+/* ===================== HELPERS ===================== */
 
 async function uploadFilesToR2(files, baseDir, prefix) {
   const limit = pLimit(4);
@@ -623,7 +582,6 @@ function validateEnv(cfg) {
   if (!cfg.webhookSecret) miss.push('WEBHOOK_SECRET');
   if (miss.length) console.warn('⚠️ Missing env vars:', miss.join(', '));
 
-  // Preview mode checks (warn-only)
   if (cfg.preview.source === 'r2') {
     const missPrev = [];
     if (!cfg.preview.r2ProxyBase) missPrev.push('R2_PROXY_BASE');
